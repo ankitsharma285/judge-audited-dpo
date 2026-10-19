@@ -10,10 +10,18 @@ length-driven advantage rather than a genuine quality one.
 
 Run once per (DPO checkpoint, slice) combination -- 4 checkpoints x 2 slices
 = 8 runs total.
+
+--both_orders (optional, default off so earlier results stay reproducible):
+judge every pair twice, once in each A/B order. A DPO "win" requires winning in
+both orders; a split verdict is a tie and counts as 0.5 in the headline
+win-rate. The eval judge picks the first-shown response ~75% of the time on
+similar pairs, so single-order scoring is noisy; this removes that bias. Also
+reports the decisive-only win-rate and the first-slot pick rate.
 """
 
 import argparse
 import json
+import math
 import random
 import re
 
@@ -109,6 +117,16 @@ or
 Final Answer: B"""
 
 
+def wilson(k, n, z=1.96):
+    if n == 0:
+        return (float("nan"), float("nan"))
+    p = k / n
+    d = 1 + z * z / n
+    c = p + z * z / (2 * n)
+    m = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return ((c - m) / d, (c + m) / d)
+
+
 def parse_verdict(text: str):
     match = re.search(r"final answer:\s*([ab])\b", text, re.IGNORECASE)
     if match:
@@ -143,6 +161,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dpo_checkpoint_name", required=True)
     parser.add_argument("--slice", required=True, choices=["indist", "genshift"])
+    parser.add_argument("--both_orders", action="store_true",
+                        help="judge each pair in both A/B orders; split verdicts count as ties (0.5)")
     args = parser.parse_args()
 
     random.seed(SEED)
@@ -159,20 +179,16 @@ def main():
 
     results = []
     unparseable = 0
+    first_slot_picks = []   # True when the judge chose the first-shown response
 
-    for i, pair in enumerate(pairs):
-        swap = random.random() < 0.5
-        response_a = pair["dpo_completion"] if swap else pair["sft_completion"]
-        response_b = pair["sft_completion"] if swap else pair["dpo_completion"]
-
+    def judge(instruction, resp_first, resp_second):
         prompt_text = JUDGE_PROMPT_TEMPLATE.format(
-            instruction=pair["instruction"], response_a=response_a, response_b=response_b
+            instruction=instruction, response_a=resp_first, response_b=resp_second
         )
         messages = [{"role": "user", "content": prompt_text}]
         inputs = tokenizer.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
         ).to("cuda")
-
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs, max_new_tokens=300, do_sample=False, pad_token_id=tokenizer.eos_token_id
@@ -180,36 +196,73 @@ def main():
         generated = tokenizer.decode(
             output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
         )
+        return parse_verdict(generated)
 
-        verdict = parse_verdict(generated)
-        if verdict is None:
-            unparseable += 1
-            continue
-
-        if verdict == "A":
-            dpo_won = swap
-        else:
-            dpo_won = not swap
-
+    for i, pair in enumerate(pairs):
         dpo_is_longer = len(pair["dpo_completion"]) > len(pair["sft_completion"])
 
-        results.append({"dpo_won": dpo_won, "dpo_is_longer": dpo_is_longer})
+        if args.both_orders:
+            v1 = judge(pair["instruction"], pair["dpo_completion"], pair["sft_completion"])  # DPO first
+            v2 = judge(pair["instruction"], pair["sft_completion"], pair["dpo_completion"])  # SFT first
+            if v1 is None or v2 is None:
+                unparseable += 1
+                continue
+            dpo_wins_1 = (v1 == "A")
+            dpo_wins_2 = (v2 == "B")
+            first_slot_picks += [v1 == "A", v2 == "A"]
+            if dpo_wins_1 and dpo_wins_2:
+                score, outcome = 1.0, "win"
+            elif (not dpo_wins_1) and (not dpo_wins_2):
+                score, outcome = 0.0, "loss"
+            else:
+                score, outcome = 0.5, "tie"
+        else:
+            swap = random.random() < 0.5
+            response_a = pair["dpo_completion"] if swap else pair["sft_completion"]
+            response_b = pair["sft_completion"] if swap else pair["dpo_completion"]
+            verdict = judge(pair["instruction"], response_a, response_b)
+            if verdict is None:
+                unparseable += 1
+                continue
+            first_slot_picks.append(verdict == "A")
+            dpo_won_single = (swap if verdict == "A" else not swap)
+            score, outcome = (1.0, "win") if dpo_won_single else (0.0, "loss")
+
+        results.append({"dpo_won": score == 1.0, "score": score, "outcome": outcome,
+                        "dpo_is_longer": dpo_is_longer})
 
         if (i + 1) % 50 == 0:
             print(f"  {i + 1}/{len(pairs)}")
 
     n_scored = len(results)
-    raw_win_rate = sum(r["dpo_won"] for r in results) / n_scored if n_scored else 0.0
+    # score is 1/0 in single-order mode (identical to the old dpo_won rate) and 1/0.5/0 with --both_orders
+    raw_win_rate = sum(r["score"] for r in results) / n_scored if n_scored else 0.0
 
     longer_subset = [r for r in results if r["dpo_is_longer"]]
     not_longer_subset = [r for r in results if not r["dpo_is_longer"]]
-    win_rate_when_longer = sum(r["dpo_won"] for r in longer_subset) / len(longer_subset) if longer_subset else None
-    win_rate_when_not_longer = sum(r["dpo_won"] for r in not_longer_subset) / len(not_longer_subset) if not_longer_subset else None
+    win_rate_when_longer = sum(r["score"] for r in longer_subset) / len(longer_subset) if longer_subset else None
+    win_rate_when_not_longer = sum(r["score"] for r in not_longer_subset) / len(not_longer_subset) if not_longer_subset else None
+
+    n_win = sum(r["outcome"] == "win" for r in results)
+    n_loss = sum(r["outcome"] == "loss" for r in results)
+    n_tie = sum(r["outcome"] == "tie" for r in results)
+    n_dec = n_win + n_loss
+    ci_lo, ci_hi = wilson(n_win, n_dec) if args.both_orders else wilson(n_win, n_scored)
+    first_slot_rate = (sum(first_slot_picks) / len(first_slot_picks)) if first_slot_picks else None
 
     print()
     print(f"=== {args.dpo_checkpoint_name} vs SFT, {args.slice} slice ===")
     print(f"Scored: {n_scored} (unparseable: {unparseable})")
+    mode = "both orders (ties = 0.5)" if args.both_orders else "single randomized order"
+    print(f"Scoring mode: {mode}")
     print(f"Raw win-rate (DPO vs SFT): {raw_win_rate:.1%}")
+    if args.both_orders:
+        print(f"  wins {n_win} / losses {n_loss} / ties {n_tie}; decisive win-rate "
+              f"{(n_win / n_dec if n_dec else float('nan')):.1%}, 95% Wilson CI [{ci_lo:.1%}, {ci_hi:.1%}] (n={n_dec})")
+    else:
+        print(f"  95% Wilson CI [{ci_lo:.1%}, {ci_hi:.1%}] (n={n_scored})")
+    if first_slot_rate is not None:
+        print(f"  judge picked the first-shown response {first_slot_rate:.1%} of the time (50% = no position bias)")
     if win_rate_when_longer is not None:
         print(f"  -- when DPO completion IS longer ({len(longer_subset)} pairs): {win_rate_when_longer:.1%}")
     else:
@@ -222,7 +275,8 @@ def main():
     print("A large gap between these two conditional win-rates indicates a length-driven")
     print("advantage rather than a genuine quality improvement.")
 
-    out_path = f"data/phase5c_scores_{args.dpo_checkpoint_name}_{args.slice}.json"
+    suffix = "_bothorders" if args.both_orders else ""
+    out_path = f"data/phase5c_scores_{args.dpo_checkpoint_name}_{args.slice}{suffix}.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -230,7 +284,11 @@ def main():
                 "slice": args.slice,
                 "n_scored": n_scored,
                 "unparseable": unparseable,
+                "both_orders": args.both_orders,
                 "raw_win_rate": raw_win_rate,
+                "n_win": n_win, "n_loss": n_loss, "n_tie": n_tie,
+                "win_rate_ci95": [ci_lo, ci_hi],
+                "first_slot_pick_rate": first_slot_rate,
                 "win_rate_when_longer": win_rate_when_longer,
                 "win_rate_when_not_longer": win_rate_when_not_longer,
                 "results": results,
