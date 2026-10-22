@@ -86,6 +86,9 @@ def main():
     parser.add_argument("--checkpoint_name", required=True, help="short name used in output filenames")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument("--slices", nargs="+", default=["indist", "genshift"],
+                        choices=["indist", "genshift", "confirm"],
+                        help="which eval slices to generate (default: indist genshift, as before)")
     args = parser.parse_args()
 
     print(f"Loading checkpoint: {args.checkpoint_path}")
@@ -97,19 +100,18 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(args.checkpoint_path, dtype=torch.bfloat16).to("cuda")
     model.eval()
 
-    print("--- In-distribution slice ---")
-    generate_for_file(
-        model, tokenizer, "data/eval_indist.json",
-        f"data/eval_completions_{args.checkpoint_name}_indist.json",
-        args.batch_size, args.max_new_tokens,
-    )
-
-    print("--- Generalization-shift slice ---")
-    generate_for_file(
-        model, tokenizer, "data/eval_genshift.json",
-        f"data/eval_completions_{args.checkpoint_name}_genshift.json",
-        args.batch_size, args.max_new_tokens,
-    )
+    slice_files = {
+        "indist": "data/eval_indist.json",
+        "genshift": "data/eval_genshift.json",
+        "confirm": "data/eval_confirm.json",   # fresh AlpacaEval prompts never used in the sweep (phase5d)
+    }
+    for sl in args.slices:
+        print(f"--- {sl} slice ---")
+        generate_for_file(
+            model, tokenizer, slice_files[sl],
+            f"data/eval_completions_{args.checkpoint_name}_{sl}.json",
+            args.batch_size, args.max_new_tokens,
+        )
 
 
 if __name__ == "__main__":

@@ -160,7 +160,7 @@ def load_and_align(sft_path, dpo_path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dpo_checkpoint_name", required=True)
-    parser.add_argument("--slice", required=True, choices=["indist", "genshift"])
+    parser.add_argument("--slice", required=True, choices=["indist", "genshift", "confirm"])
     parser.add_argument("--both_orders", action="store_true",
                         help="judge each pair in both A/B orders; split verdicts count as ties (0.5)")
     args = parser.parse_args()

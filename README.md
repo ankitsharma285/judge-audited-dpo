@@ -2,7 +2,7 @@
 
 An end-to-end post-training study on **Qwen2.5-1.5B**: SFT and DPO implemented from scratch (custom losses, no library trainers), preference labels produced by an LLM judge that was **validated against human annotations before being trusted**, and downstream results evaluated with confidence intervals and a length-stratified check rather than a single win-rate number.
 
-> **Status:** active research project. Phases 0 to 5 are complete, including the learning-rate sweep and a head-to-head test of the two labeling methods. Remaining work: a second seed at LR = 5e-6 (in progress), LR above 5e-6, then dataset scale and epoch count, each run in isolation. See [Status and next steps](#status-and-next-steps).
+> **Status:** active research project. Phases 0 to 5 are complete: learning-rate sweep, three training seeds at the best LR for both label types, a confirmation run on fresh prompts, and direct head-to-head tests of the two labeling methods. Remaining: a second, independent eval judge. See [Status and next steps](#status-and-next-steps).
 
 ---
 
@@ -11,12 +11,11 @@ An end-to-end post-training study on **Qwen2.5-1.5B**: SFT and DPO implemented f
 - Implemented **SFT** (response-only loss masking) and **DPO** (summed response log-probs, frozen reference model) from scratch in PyTorch.
 - Built a **bias-aware LLM-judge labeling pipeline** (position randomization, explicit length control, CoT rubric) and validated it against the human-annotated AlpacaFarm cross-annotations with a pre-set threshold, a diagnosed failure mode, and a stopping rule.
 - Three **distinct model families** fill the three roles (policy / labeling judge / eval judge) to avoid self-preference bias.
-- **First result was null:** at LR = 1e-6, none of four DPO configurations beat SFT in-distribution (all win-rates 48 to 50%, CIs include 50%).
-- **A controlled LR sweep found the cause.** With LR as the only changed variable, the bias-mitigated config at **LR = 5e-6** beat SFT on held-out prompts. Under both-order judging (a pair counts only if the judge prefers the same response in both orders), it won **64 vs. 27** decisive pairs in-distribution (p = 0.0001) and **33 vs. 6** under distribution shift (p < 0.0001). Counting split verdicts as half, that is **57.4%** and **63.5%**. It wins at least as often when its answer is not longer than SFT's, which argues against a length-driven gain. One seed.
-- **The LR effect appears for both label types, more weakly for naive.** At 1e-6 and 2e-6 neither policy is reliably ahead of SFT. At 5e-6 the mitigated policy is ahead on both slices; the naive policy is ahead only under shift (in-dist 55 vs. 45 decisive pairs, p = 0.37).
-- **Label debiasing did not measurably change quality.** A head-to-head of the mitigated and naive 5e-6 policies (each pair judged in both orders) found no detectable difference. Two-thirds of pairs were position-dependent ties, and among decisive pairs the mitigated policy won 56.0% in-dist (CI [45.3, 66.1]) and 42.9% under shift (CI [28.0, 59.1]). The test was underpowered (119 decisive pairs; about 540 needed to detect a 56% effect), so this is "not detected", not "no effect".
-- **Label debiasing did change verbosity.** The naive-label policy's answer was longer than the mitigated policy's in about 85% (in-dist) and 78% (shift) of pairs. Against SFT, the naive policy's answer was longer in 79% / 83% of pairs, vs. 63% / 71% for mitigated. One seed per config; this describes length, not quality.
-- **The eval judge has a strong position bias** (it picked the first-shown response about 75% of the time when comparing two similar policies), which only became visible when scoring both orders.
+- **First result was null:** at LR = 1e-6, none of four DPO configurations beat SFT in-distribution (all win-rates 48 to 50%, CIs include 50%). A controlled LR sweep (LR the only changed variable) found the cause: 1e-6 and 2e-6 are indistinguishable from SFT, and **5e-6 beats SFT**.
+- **The 5e-6 gain reproduces.** Across three training seeds the mitigated-label policy scores 58.2 to 59.4% in-distribution (single-order, 95% CIs all exclude 50%), and wins about 2 to 3 decisive pairs for every loss under both-order judging. The naive-label policy shows the same pattern more weakly in-distribution (53.4 to 56.8%).
+- **It holds on prompts the sweep never saw.** On 453 fresh AlpacaEval prompts (shift-type), all six 5e-6 policies beat SFT: single-order 56.9 to 59.8% (CIs exclude 50%), and 72 to 78% of decisive both-order pairs. This was a pre-specified test; the primary policy passed with p = 3e-12. The earlier 68.0% shift-slice figure was optimistic: the same policy scores 57.1% on the fresh prompts.
+- **Label debiasing did not improve quality.** Head-to-head, mitigated vs. naive policies (three seed pairs, each pair judged in both orders): no difference in-distribution (56.0%, 46.1%, 53.6% for mitigated among decisive pairs), and the shift slice leans slightly toward naive (40.0 to 43.2%). On the fresh prompts the naive policy is about 2 points ahead against SFT (59.4% vs. 57.6% mean). Debiasing did change behaviour: the naive policy writes longer answers (longer than SFT's in about 90% of fresh-prompt pairs vs. about 78% for mitigated) and its chosen-response likelihood falls further during training.
+- **The eval judge has a strong position bias** (it picks the first-shown response 75 to 85% of the time), which only became visible when scoring both orders. Single-order win-rates are therefore noisy and, if anything, conservative.
 
 ---
 
@@ -38,6 +37,38 @@ Judge: Gemma-2-9B-it (CoT rubric, position-randomized, one judgment per prompt).
 | naive labels, β=0.1 | 5e-6 | 53.8% | [47.6, 59.8] | 65.0% | [55.3, 73.6] |
 
 At LR = 1e-6 and 2e-6, only one of twelve comparisons (naive labels at 1e-6, shift slice) excluded 50%, and it only partially survived the length check below. At LR = 5e-6, the mitigated policy excludes 50% on both slices; the naive policy excludes it on the shift slice only. The two label types track each other across LR, and their 5e-6 intervals overlap heavily (see the head-to-head below). One seed per cell.
+
+### Three training seeds at 5e-6 (vs. SFT)
+
+Seeds 42 (the original run), 1234, 5678. Single-order win-rate with 95% Wilson CI; both-order = wins : losses among pairs where the judge preferred the same response in both orders (decisive win-rate in parentheses).
+
+| Labels | Seed | In-dist, single-order | In-dist, both-order | Shift, single-order | Shift, both-order |
+|---|---|---|---|---|---|
+| mitigated | 42 | 59.4% [53.2, 65.3] | 64 : 27 (70.3%) | 68.0% [58.3, 76.3] | 33 : 6 (84.6%) |
+| mitigated | 1234 | 59.0% [52.8, 65.0] | 60 : 30 (66.7%) | 61.0% [51.2, 70.0] | 26 : 9 (74.3%) |
+| mitigated | 5678 | 58.2% [52.0, 64.2] | 63 : 22 (74.1%) | 67.0% [57.3, 75.4] | 32 : 5 (86.5%) |
+| naive | 42 | 53.8% [47.6, 59.8] | 55 : 45 (55.0%) | 65.0% [55.3, 73.6] | 31 : 9 (77.5%) |
+| naive | 1234 | 53.4% [47.2, 59.5] | 57 : 43 (57.0%) | 55.6% [45.7, 65.0] | 28 : 14 (66.7%) |
+| naive | 5678 | 56.8% [50.6, 62.8] | 64 : 44 (59.3%) | 67.0% [57.3, 75.4] | 38 : 8 (82.6%) |
+
+Seed-to-seed spread is small in-distribution (mitigated 58.2 to 59.4%, naive 53.4 to 56.8%) and larger on the 100-prompt shift slice (mitigated 61.0 to 68.0%, naive 55.6 to 67.0%), as expected from 100 prompts. The lower-LR rows in the first table are single seeds.
+
+### Confirmation on fresh prompts (vs. SFT, 5e-6)
+
+The LR was chosen using the in-dist and shift slices, so results on them carry selection bias. The 453 AlpacaEval prompts in neither slice (all from `oasst`, `koala`, `helpful_base`, `vicuna`, so shift-type) were evaluated once, with the analysis fixed beforehand: the seed-42 mitigated policy, both-order, exact sign test, "confirmed" if the decisive win-rate exceeds 50% with p < 0.05.
+
+| Labels | Seed | Single-order | Both-order W : L : T | Decisive win-rate | Longer than SFT |
+|---|---|---|---|---|---|
+| mitigated | 42 (primary) | 57.1% [52.5, 61.6] | 117 : 33 : 302 | 78.0% [70.7, 83.9], p = 3e-12 | 361/452 |
+| mitigated | 1234 | 58.8% [54.2, 63.2] | 114 : 34 : 303 | 77.0% [69.6, 83.1] | 353/451 |
+| mitigated | 5678 | 56.9% [52.3, 61.3] | 105 : 39 : 308 | 72.9% [65.1, 79.5] | 350/452 |
+| naive | 42 | 58.8% [54.3, 63.3] | 131 : 39 : 282 | 77.1% [70.2, 82.7] | 407/452 |
+| naive | 1234 | 59.8% [55.2, 64.2] | 128 : 42 : 283 | 75.3% [68.3, 81.2] | 411/453 |
+| naive | 5678 | 59.5% [54.9, 63.9] | 129 : 50 : 273 | 72.1% [65.1, 78.1] | 403/452 |
+
+- **Confirmed.** The primary test passed, and so did every other policy. This confirms the shift-type result; it does not confirm in-distribution, because no fresh in-distribution prompts were used.
+- **Shift numbers were optimistic.** The mitigated policies score 61 to 68% on the 100-prompt shift slice but 56.9 to 58.8% on the fresh prompts (naive: 55.6 to 67.0% vs. 58.8 to 59.8%). Selection on the slice and a favorable 100-prompt sample are both plausible causes and cannot be separated here. The fresh-prompt figure is the better estimate.
+- **Naive is slightly ahead on the fresh prompts** (mean single-order 59.4% vs. 57.6%), with overlapping intervals. It also writes longer answers (about 90% of pairs longer than SFT's vs. about 78%).
 
 ### Length-stratified check (LR = 5e-6, mitigated, β=0.1)
 
@@ -92,17 +123,21 @@ The 5e-6 policies were re-scored against SFT with every pair judged in both orde
 
 ### Head-to-head: mitigated vs. naive labels (LR = 5e-6, β = 0.1)
 
-Comparing each policy to SFT separately cannot show whether the two labeling methods differ. So the two policies were scored directly against each other. Each pair is judged in **both orders**; a policy gets a win only if it wins in both, and a split verdict counts as a tie (the judge's preference followed position, not content).
+Comparing each policy to SFT separately cannot show whether the two labeling methods differ. So the policies trained on the same seed were scored directly against each other, each pair judged in **both orders**; a policy gets a win only if it wins in both, and a split verdict counts as a tie (the judge's preference followed position, not content). A is mitigated.
 
-| Slice | Mitigated wins | Naive wins | Ties | Mitigated win-rate among decisive pairs | Sign-test p |
-|---|---|---|---|---|---|
-| In-dist (n=251) | 47 | 37 | 167 (66.5%) | 56.0%, CI [45.3, 66.1] | 0.33 |
-| Shift (n=100) | 15 | 20 | 65 (65.0%) | 42.9%, CI [28.0, 59.1] | 0.50 |
-| Pooled | 62 | 57 | 232 | 52.1%, CI [43.2, 60.9] | 0.71 |
+| Seed pair | In-dist: A : B | Mitigated rate, sign-test p | Shift: A : B | Mitigated rate, sign-test p |
+|---|---|---|---|---|
+| 42 | 47 : 37 | 56.0% [45.3, 66.1], 0.33 | 15 : 20 (65 ties) | 42.9% [28.0, 59.1], 0.50 |
+| 1234 | 41 : 48 (162 ties) | 46.1% [36.1, 56.4], 0.53 | 16 : 21 (62 ties) | 43.2% [28.7, 59.1], 0.51 |
+| 5678 | 52 : 45 (154 ties) | 53.6% [43.7, 63.2], 0.54 | 18 : 27 (55 ties) | 40.0% [27.0, 54.5], 0.23 |
+| pooled | 140 : 130 | 51.9% [45.9, 57.7], 0.58 | 49 : 68 | 41.9% [33.3, 50.9], 0.10 |
 
-- **No detectable quality difference.** Both intervals include 50%, the direction flips between slices, and only 119 of 351 pairs were decisive. At this effect size (about 56% vs. 50%), roughly 540 decisive pairs would be needed for 80% power, which this eval set cannot supply, so the question is not resolvable here.
-- **Strong position bias.** The eval judge picked the first-shown response 75.3% (in-dist) and 76.5% (shift) of the time. Random A/B assignment in the earlier SFT-vs-DPO scoring cancels this on average but adds noise, and likely pulls those win-rates toward 50%. This was not measured for those runs.
-- **Length.** The mitigated policy's answer was longer than the naive policy's in only 14.7% (in-dist) and 22.0% (shift) of pairs. Win-rates split by length are not interpretable (the mitigated-longer cells have n=16 and n=8).
+- **No difference in-distribution.** The three seeds fall on both sides of 50% and the pooled rate is 51.9%.
+- **Shift leans toward naive**, in all three pairs (40.0 to 43.2%), but no single pair is significant. Pooled p = 0.10 is optimistic because the seed pairs share prompts and are not independent. Treat it as a hint. The fresh-prompt results (naive about 2 points ahead against SFT) point the same way and are also within noise.
+- **About 60 to 65% of pairs are ties**, so each comparison rests on 84 to 97 decisive in-dist pairs and 35 to 45 on shift. At an effect of about 56% vs. 50%, roughly 540 decisive pairs would be needed for 80% power, which this eval set cannot supply. The conclusion is "no quality advantage for mitigated labels was found", not "no effect".
+- **An earlier indirect comparison was misleading.** Against SFT, mitigated looked about 4 points ahead of naive in-distribution (58.9% vs. 54.7% mean across seeds). Compared directly there is no difference. Comparing through a shared baseline is not a substitute for a paired comparison.
+- **Length.** The mitigated policy's answer was longer than the naive policy's in only 15 to 22% of pairs. Win-rates split by length are not interpretable (the mitigated-longer cells have as few as 4 decisive pairs).
+- **Training behaviour differs.** In the second epoch the implicit reward of the chosen response averages about +0.03 to +0.04 for mitigated runs and −0.07 to −0.14 for naive runs, while rejected falls further for naive (about −0.7 to −0.8 vs. −0.16 to −0.18). Naive training pushes the chosen response's likelihood down relative to the reference. These rewards are summed over response tokens, so they scale with length and the naive policy's answers are longer; treat this as a clue, not a mechanism.
 
 ---
 
@@ -168,16 +203,17 @@ The shipped judge scored below the pre-set 60% threshold. It was shipped anyway 
 
 Please read these before citing any number above.
 
-- **Single training run per configuration.** Seed-to-seed variance is not measured. The 5e-6 result in particular comes from one run.
-- **LR was selected on the eval prompts.** The sweep picked 5e-6 using the same held-out prompts the results are reported on, which biases the best cell upward. Two things make a pure selection artifact less likely: the naive-label sweep shows the same jump at 5e-6 on the shift slice without being tuned separately, and the mitigated 5e-6 both-order sign-test p-values (0.0001 and <0.0001) are below 0.05/16, a Bonferroni threshold for the 16 sweep comparisons (8 configs x 2 slices; only the 5e-6 policies were scored in both orders, so this is a rough guide, not a formal correction). The trend across LR is not monotone (for example, mitigated in-dist is 48.0%, 47.8%, then 59.4%), so do not describe it as a smooth scaling curve. A confirmation run on fresh prompts, or a second seed, would close this.
-- **Eval-judge position bias.** The eval judge picks the first-shown response 75 to 80% of the time. Single-order scoring (used for the main SFT-vs-DPO tables) is noisy because of this. The 5e-6 policies were re-scored with both-order judging and the improvement over SFT held, but only 37 to 40% of pairs are decisive, so those intervals are conditional on judge agreement. The other LR and beta configs were not re-scored.
-- **One eval judge.** The eval judge shares its CoT rubric with the labeling judge (different model family, same criteria), so the two are not fully independent in what they reward. A second, independently designed judge would be a stronger check, and no human evaluation of the final policies was done.
+- **Seeds exist only for the two 5e-6 configurations** (three each). The LR sweep rows at 1e-6 and 2e-6 and the beta ablation are single runs.
+- **LR was selected on the eval prompts.** 5e-6 was picked using the same slices the first results were reported on. The fresh-prompt confirmation addresses this for shift-type prompts (453 prompts, all pass). It does **not** cover in-distribution prompts, which still carry the selection caveat. The in-dist gain reproduced across three seeds, which addresses seed variance but not selection. The trend across LR is also not smooth (for example, mitigated in-dist is 48.0%, 47.8%, then 59.4%), so it should not be described as a scaling curve.
+- **No LR above 5e-6 was tried**, so the optimum may lie beyond the grid, and over-optimization behaviour (the chosen-likelihood drop seen in the naive runs) was not explored.
+- **Eval-judge position bias.** The eval judge picks the first-shown response 75 to 85% of the time. Single-order scoring is noisy because of this. The 5e-6 policies were re-scored with both-order judging and the improvement held, but only 35 to 40% of pairs are decisive on the slices (about 33% on the fresh prompts), so those rates are conditional on judge agreement. The other LR and beta configs were not re-scored.
+- **One eval judge.** The eval judge shares its CoT rubric with the labeling judge (different model family, same criteria), so the two are not fully independent in what they reward. A second, independently designed judge has not yet been run, and no human evaluation of the final policies was done. Agreement between two LLM judges would reduce this concern but not prove quality.
 - **Judge reliability is below the human ceiling** (57.2% vs. 64.2% for the labeling judge), so a meaningful share of training labels is noisy.
-- **Small data.** About 1.9K DPO pairs; 100 prompts in the shift slice (the length-stratified shift cells are as small as n=29).
+- **Small data.** About 1.9K DPO pairs; 100 prompts in the shift slice (the length-stratified shift cells are as small as n=29); all eval prompts share one benchmark.
 - **Length control is a stratified check, not a regression.** It is a transparent robustness test, not a replacement for AlpacaEval's length-controlled metric.
 - **Spot-check is weak evidence.** A 25-item single-annotator spot-check (72% agreement, CI roughly 54 to 90%) used best-vs-worst pairs, which are easier than typical pairs. It is a sanity check, not validation.
-- **The naive-vs-mitigated question is unresolved at this scale.** The head-to-head found no detectable difference in quality, but with 65 to 67% ties it had little power. "Label debiasing does not change quality" is not established; only "no difference was detected, and it would take far more pairs to detect a small one".
-- **The length difference between label types is one seed per config** and is a description of response length, not evidence about quality.
+- **The naive-vs-mitigated question is underpowered.** About 60 to 65% of head-to-head pairs are position-dependent ties. No advantage for mitigated labels was found; a small difference in either direction cannot be excluded. Pooled head-to-head p-values across seeds are optimistic because the seed pairs share prompts.
+- **The length and likelihood differences between label types are descriptions**, not evidence about quality or mechanism.
 - Results are specific to this model size, dataset, and judge setup.
 
 ---
@@ -190,13 +226,15 @@ Please read these before citing any number above.
 - [x] Phase 3: completion generation and dual (mitigated / naive) labeling
 - [x] Phase 4: DPO training (4 configs at LR 1e-6, plus LR sweep on mitigated)
 - [x] Phase 5: eval-judge validation and held-out evaluation
-- [x] LR sweep on mitigated labels (1e-6, 2e-6, 5e-6) with held-out evaluation
-- [x] LR sweep on naive labels (1e-6, 2e-6, 5e-6) with held-out evaluation
-- [x] Both-order re-scoring of the two 5e-6 policies vs. SFT (improvement holds; other configs not re-scored)
-- [x] Head-to-head of mitigated vs. naive at 5e-6 (both-order judging): no detectable quality difference
-- [ ] Second seed at 5e-6 for both label types (in progress)
-- [ ] LR above 5e-6 (the best result is at the edge of the grid)
-- [ ] Optional: larger preference dataset, then epoch count (each run in isolation)
+- [x] LR sweep on mitigated and naive labels (1e-6, 2e-6, 5e-6) with held-out evaluation
+- [x] Both-order re-scoring of the 5e-6 policies vs. SFT (improvement holds; other configs not re-scored)
+- [x] Head-to-head of mitigated vs. naive labels, three seed pairs: no quality advantage for mitigated labels
+- [x] Three training seeds at 5e-6, both label types: gain reproduces
+- [x] Confirmation on 453 fresh AlpacaEval prompts, analysis fixed in advance: passed (shift-type prompts only)
+- [ ] Second, independent eval judge (different family, plain prompt), validated against human annotations first
+- [ ] Optional: LR above 5e-6 (best result is at the edge of the grid), chosen on a dev split and labeled exploratory
+- [ ] Optional: head-to-head on the fresh prompts, to test the hint that naive labels do slightly better under shift
+- [ ] Optional: larger preference dataset, then epoch count (not resolvable with this eval)
 
 ---
 
@@ -216,6 +254,7 @@ phase5a_eval_judge_pilot.py      # eval-judge validation
 phase5b_prepare_eval_split.py    # in-dist / shift slices of AlpacaEval
 phase5b_generate_eval_completions.py
 phase5c_score_eval.py            # SFT-vs-DPO scoring, win-rate + length strata (--both_orders optional)
+phase5d_prepare_confirm_set.py   # fresh AlpacaEval prompts not used by the LR sweep
 score_h2h.py                     # DPO-vs-DPO head-to-head, both-order judging, sign test
 slurm/                           # example Slurm job scripts (cluster-specific)
 ```
@@ -271,8 +310,6 @@ These cost real debugging time, so they are recorded here:
 
 ## License and data
 
-Code: add your preferred license here. Datasets and models (Alpaca, AlpacaEval, Qwen2.5, Llama-3.1, Gemma-2) are subject to their own licenses and terms; check them before redistributing any derived data or weights.
+Code: MIT License. Datasets and models (Alpaca, AlpacaEval, Qwen2.5, Llama-3.1, Gemma-2) are subject to their own licenses and terms; check them before redistributing any derived data or weights.
 
-## Author
 
-Ankit Sharma, [GitHub / LinkedIn / email]
